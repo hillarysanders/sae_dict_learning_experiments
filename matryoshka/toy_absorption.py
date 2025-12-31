@@ -3,11 +3,10 @@
 from __future__ import annotations
 
 import json
-import math
 import random
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Literal, Tuple
+from typing import Dict, Tuple
 
 import torch
 from tqdm import tqdm
@@ -16,9 +15,6 @@ from config import Config
 from sae import SparseAutoencoder, normalize_decoder_rows
 from sparsity import UniformL1Penalty, FrequencyWeightedL1Penalty
 from stoch_avail import StochasticAvailability
-
-
-ToyMethod = Literal["baseline_l1", "freq_weighted_l1", "stoch_avail_l1"]
 
 
 # ----------------------------
@@ -47,7 +43,6 @@ class ToyTreeSpec:
 def make_orthonormal_features(d_model: int, n_feats: int, device: torch.device) -> torch.Tensor:
     """Return [n_feats, d_model] approximately orthonormal directions."""
     X = torch.randn(n_feats, d_model, device=device)
-    # QR on (d_model x n_feats) gives orthonormal columns; transpose back
     Q, _ = torch.linalg.qr(X.t(), mode="reduced")  # [d, n_feats]
     return Q.t().contiguous()  # [n_feats, d]
 
@@ -69,23 +64,20 @@ def sample_tree_batch(
     children = U[1:]         # [C, d]
     C = children.shape[0]
 
-    # parent always active with amplitude ~1
     parent_amp = torch.ones(n, device=device)
 
-    # choose whether a child is active, and which
     has_child = torch.rand(n, device=device) < spec.child_prob
     child_idx = torch.full((n,), -1, device=device, dtype=torch.long)
-    child_idx[has_child] = torch.randint(0, C, (int(has_child.sum().item()),), device=device)
+    if has_child.any():
+        child_idx[has_child] = torch.randint(0, C, (int(has_child.sum().item()),), device=device)
 
     child_amp = torch.zeros(n, device=device)
     child_amp[has_child] = 1.0
 
-    # Build x
     x = parent_amp.unsqueeze(1) * parent.unsqueeze(0)  # [n, d]
     if has_child.any():
         x[has_child] += child_amp[has_child].unsqueeze(1) * children[child_idx[has_child]]
 
-    # Add noise
     if spec.noise_std > 0:
         x = x + spec.noise_std * torch.randn_like(x)
 
@@ -93,13 +85,14 @@ def sample_tree_batch(
 
 
 # ----------------------------
-# Training loop (toy)
+# Penalty selection (toy uses same sparsity knob)
 # ----------------------------
 
-def make_penalty(cfg: Config, method: ToyMethod, device: torch.device):
-    if method == "baseline_l1":
+def make_penalty(cfg: Config, device: torch.device):
+    if cfg.sparsity == "l1_uniform":
         return UniformL1Penalty(lambda_base=cfg.lambda_base)
-    if method == "freq_weighted_l1":
+
+    if cfg.sparsity == "l1_freq_weighted":
         return FrequencyWeightedL1Penalty(
             n_latents=cfg.n_latents,
             lambda_base=cfg.lambda_base,
@@ -112,10 +105,16 @@ def make_penalty(cfg: Config, method: ToyMethod, device: torch.device):
             normalize_mean=cfg.fw_normalize_mean,
             device=device,
         )
-    if method == "stoch_avail_l1":
-        return UniformL1Penalty(lambda_base=cfg.lambda_base)
-    raise ValueError(method)
 
+    if cfg.sparsity == "batchtopk":
+        raise ValueError("toy: sparsity='batchtopk' not implemented yet (later commit).")
+
+    raise ValueError(f"Unknown sparsity: {cfg.sparsity}")
+
+
+# ----------------------------
+# Metrics
+# ----------------------------
 
 @torch.no_grad()
 def fvu(x: torch.Tensor, x_hat: torch.Tensor) -> float:
@@ -152,21 +151,13 @@ def match_latents_to_truth(
     sae: SparseAutoencoder,
     U: torch.Tensor,  # [1+C, d_model] true directions
 ) -> Tuple[int, torch.Tensor]:
-    """Return (parent_latent_index, child_latent_indices[C]).
-
-    We match each true feature direction to the closest decoder row by cosine similarity.
-    This is greedy and simple; sufficient for the toy demo.
-    """
+    """Return (parent_latent_index, child_latent_indices[C])."""
     W = normalize_decoder_rows(sae.W_dec).to(torch.float32)  # [K, d]
     T = normalize_decoder_rows(U).to(torch.float32)          # [1+C, d]
-
-    # sims: [K, 1+C]
-    sims = W @ T.t()
-    # For each truth feature, pick best latent
-    best_lat_for_truth = sims.argmax(dim=0)  # [1+C]
-
+    sims = W @ T.t()                                         # [K, 1+C]
+    best_lat_for_truth = sims.argmax(dim=0)                  # [1+C]
     parent_lat = int(best_lat_for_truth[0].item())
-    child_lats = best_lat_for_truth[1:].clone()  # [C]
+    child_lats = best_lat_for_truth[1:].clone()              # [C]
     return parent_lat, child_lats
 
 
@@ -178,46 +169,40 @@ def absorption_rate_simple(
     child_idx: torch.Tensor,      # [N] (-1 or child id)
     thresh: float = 0.0,
 ) -> float:
-    """Absorption rate proxy on toy data.
-
-    We say absorption happens on an example if:
-      - some child is active (child_idx != -1)
-      - that child's matched latent is active
-      - but the parent latent is NOT active
-
-    Return fraction of child-active examples where parent is suppressed.
-    """
+    """Absorption rate proxy on toy data."""
     parent_active = (a[:, parent_lat] > thresh)
 
-    # For each example with child, check matched child latent
     mask = (child_idx != -1)
     if mask.sum().item() == 0:
         return 0.0
 
-    child_ids = child_idx[mask]  # [M]
-    child_lat_for_ex = child_lats[child_ids]  # [M]
+    child_ids = child_idx[mask]                 # [M]
+    child_lat_for_ex = child_lats[child_ids]    # [M]
     ex_idx = torch.nonzero(mask, as_tuple=False).squeeze(1)
 
     child_active = (a[ex_idx, child_lat_for_ex] > thresh)
     parent_suppressed = (~parent_active[mask])
 
-    # Only count cases where child latent is actually active (so "child present" is represented)
     denom = child_active.sum().item()
     if denom == 0:
         return 0.0
-
     num = (child_active & parent_suppressed).sum().item()
     return float(num / denom)
 
 
-def run_toy(method: ToyMethod, cfg: Config, spec: ToyTreeSpec, device: torch.device) -> Dict[str, float]:
+# ----------------------------
+# Main toy runner
+# ----------------------------
+
+def run_toy(cfg: Config, spec: ToyTreeSpec, device: torch.device) -> Dict[str, float]:
     torch.manual_seed(spec.seed)
     random.seed(spec.seed)
 
-    # Ground-truth directions: [parent + children]
+    if cfg.recon_variant == "matryoshka":
+        raise ValueError("toy: recon_variant='matryoshka' not implemented yet (later commit).")
+
     U = make_orthonormal_features(spec.d_model, 1 + spec.n_children, device=device)
 
-    # SAE
     sae = SparseAutoencoder(
         d_model=spec.d_model,
         n_latents=cfg.n_latents,
@@ -227,10 +212,10 @@ def run_toy(method: ToyMethod, cfg: Config, spec: ToyTreeSpec, device: torch.dev
         dtype=torch.float32,
     )
 
-    penalty = make_penalty(cfg, method, device=device)
+    penalty = make_penalty(cfg, device=device)
 
     stoch = None
-    if method == "stoch_avail_l1":
+    if cfg.recon_variant == "stoch_avail":
         stoch = StochasticAvailability(
             n_latents=cfg.n_latents,
             p_min=cfg.sa_p_min,
@@ -242,25 +227,25 @@ def run_toy(method: ToyMethod, cfg: Config, spec: ToyTreeSpec, device: torch.dev
 
     opt = torch.optim.AdamW(sae.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
 
-    # Train
     sae.train()
     bs = cfg.batch_size
-
     steps = max(1, cfg.num_steps)
-    pbar = tqdm(range(steps), desc=f"toy train [{method}]", dynamic_ncols=True)
+
+    pbar = tqdm(range(steps), desc=f"toy train [{cfg.recon_variant}+{cfg.sparsity}]", dynamic_ncols=True)
     for step in pbar:
         x, _ = sample_tree_batch(U, spec, n=bs, device=device)
-
         out = sae(x)
         a = out.a
 
-        # stochastic availability masks only reconstruction
-        if method == "stoch_avail_l1":
+        if cfg.recon_variant == "stoch_avail":
             assert stoch is not None
-            a_m, _ = stoch.mask(a)
+            a_m, sa_stats = stoch.mask(a)
             x_hat = sae.decode(a_m)
-        else:
+        elif cfg.recon_variant == "standard":
             x_hat = out.x_hat
+            sa_stats = {}
+        else:
+            raise ValueError(cfg.recon_variant)
 
         l_recon = torch.mean((x - x_hat) ** 2)
         l_sparse, sparse_stats = penalty.compute(a, step=step + 1)
@@ -276,6 +261,7 @@ def run_toy(method: ToyMethod, cfg: Config, spec: ToyTreeSpec, device: torch.dev
                 recon=f"{l_recon.item():.3e}",
                 sparse=f"{l_sparse.item():.3e}",
                 lam=f"{sparse_stats.get('lambda_mean', cfg.lambda_base):.2e}",
+                mask=f"{sa_stats.get('sa_mask_mean', float('nan')):.2f}" if sa_stats else "",
             )
 
     # Eval
@@ -285,7 +271,6 @@ def run_toy(method: ToyMethod, cfg: Config, spec: ToyTreeSpec, device: torch.dev
     a_eval = out.a
     x_hat = out.x_hat
 
-    # Match latents to truth + compute absorption
     parent_lat, child_lats = match_latents_to_truth(sae, U)
     abs_rate = absorption_rate_simple(
         a_eval, parent_lat, child_lats, child_idx, thresh=cfg.active_threshold
@@ -297,7 +282,8 @@ def run_toy(method: ToyMethod, cfg: Config, spec: ToyTreeSpec, device: torch.dev
         "avg_max_decoder_cos": avg_max_decoder_cos(sae.W_dec),
         "absorption_rate": abs_rate,
         "parent_latent": float(parent_lat),
-        "mean_lambda": float(cfg.lambda_base),
+        "lambda_base": float(cfg.lambda_base),
+        "recon_variant": float(0.0),  # keep numeric-only if you want (or remove)
     }
 
 
@@ -307,7 +293,6 @@ def main() -> None:
     cfg = tyro.cli(Config)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    # Keep toy small + fast by default
     spec = ToyTreeSpec(
         d_model=256,
         n_children=8,
@@ -318,10 +303,17 @@ def main() -> None:
         seed=cfg.seed,
     )
 
-    # For toy, interpret cfg.num_steps as steps (not tokens); batch_size is examples/step.
-    results = {}
-    for method in ["baseline_l1", "freq_weighted_l1", "stoch_avail_l1"]:
-        results[method] = run_toy(method=method, cfg=cfg, spec=spec, device=device)
+    # Run the three combinations you previously ran
+    results: Dict[str, Dict[str, float]] = {}
+
+    def run_one(tag: str, recon_variant: str, sparsity: str):
+        cfg.recon_variant = recon_variant  # type: ignore
+        cfg.sparsity = sparsity            # type: ignore
+        results[tag] = run_toy(cfg=cfg, spec=spec, device=device)
+
+    run_one("standard_l1_uniform", "standard", "l1_uniform")
+    run_one("standard_l1_freq_weighted", "standard", "l1_freq_weighted")
+    run_one("stoch_avail_l1_uniform", "stoch_avail", "l1_uniform")
 
     out_path = Path(cfg.out_dir) / f"toy_absorption_{cfg.run_name}.json"
     out_path.parent.mkdir(parents=True, exist_ok=True)
