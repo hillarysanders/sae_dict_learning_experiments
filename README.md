@@ -1,13 +1,13 @@
 
 ```
 python3 train.py \
-  --hf_dataset wikitext \
-  --hf_dataset_config wikitext-2-raw-v1 \
-  --hf_split train \
-  --seq_len 128 \
+  --recon_variant matryoshka \
+  --sparsity batchtopk \
+  --target_l0 40 \
+  --n_latents 2048 \
   --batch_size 1 \
-  --num_steps 200 \
-  --log_every 10
+  --seq_len 128 \
+  --num_steps 50
 ```
 
 ```

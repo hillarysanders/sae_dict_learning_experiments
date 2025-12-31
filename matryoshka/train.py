@@ -32,6 +32,46 @@ def set_seed(seed: int) -> None:
     torch.cuda.manual_seed_all(seed)
 
 
+def _default_matryoshka_ms(n_latents: int) -> list[int]:
+    """
+    Paper uses a small set of increasing prefix sizes up to full D.
+    For generality, pick a geometric-ish ladder that’s stable for small/large K.
+    """
+    # Keep it simple: 4 prefixes + full
+    # Avoid tiny m that makes training too noisy.
+    ladder = []
+    for frac in (1/32, 1/16, 1/8, 1/4):
+        m = int(round(n_latents * frac))
+        ladder.append(max(8, min(m, n_latents)))
+    ladder = sorted(set(ladder))
+    if ladder[-1] != n_latents:
+        ladder.append(n_latents)
+    return ladder
+
+
+def _resolve_matryoshka_ms(cfg: Config) -> list[int]:
+    ms = list(getattr(cfg, "matryoshka_ms", []) or [])
+    if not ms:
+        ms = _default_matryoshka_ms(cfg.n_latents)
+
+    # sanitize
+    ms = sorted(set(int(m) for m in ms))
+    ms = [m for m in ms if 1 <= m <= cfg.n_latents]
+
+    if getattr(cfg, "matryoshka_include_full", True):
+        if (not ms) or (ms[-1] != cfg.n_latents):
+            ms.append(cfg.n_latents)
+
+    if not ms:
+        raise ValueError("matryoshka_ms resolved to empty; check config.")
+    return ms
+
+
+def _decode_prefix(sae: SparseAutoencoder, a_used: torch.Tensor, m: int) -> torch.Tensor:
+    # a_used: [N, K], use only first m latents and first m decoder rows
+    return a_used[:, :m] @ sae.W_dec[:m] + sae.b_dec
+
+
 def _make_penalty(cfg: Config, device: torch.device):
     """Return a sparsity penalty module for L1-based modes.
     For BatchTopK, sparsity is enforced by gating (no penalty loss), so return None.
@@ -70,11 +110,12 @@ def train(cfg: Config) -> Path:
     if cfg.sparsity == "batchtopk" and cfg.target_l0 is None:
         raise ValueError("sparsity='batchtopk' requires --target_l0 (e.g. --target_l0 40).")
 
-    if cfg.recon_variant == "matryoshka":
-        raise ValueError("recon_variant='matryoshka' not implemented yet (later commit).")
-
     model = load_tl_model(cfg.model_name, device=device, dtype=dtype)
     hook_name = cfg.resolved_hook()
+
+    if cfg.recon_variant == "matryoshka":
+        ms = _resolve_matryoshka_ms(cfg)
+        print(f"[matryoshka] prefix sizes: {ms}")
 
     # Get d_model by grabbing one forward pass (cheap and robust).
     toks0 = torch.tensor([[model.tokenizer.bos_token_id] * cfg.seq_len], device=device)
@@ -160,16 +201,37 @@ def train(cfg: Config) -> Path:
         sa_stats: Dict[str, float] = {}
         if cfg.recon_variant == "stoch_avail":
             assert stoch_avail is not None
-            # availability masking only affects reconstruction path
             a_masked, sa_stats = stoch_avail.mask(a_used)
             x_hat = sae.decode(a_masked)
+            l_recon = recon_loss(x, x_hat, cfg.recon_loss)
+
         elif cfg.recon_variant == "standard":
-            # decode from the activations used (batchtopk-gated if enabled)
             x_hat = sae.decode(a_used) if cfg.sparsity == "batchtopk" else out.x_hat
+            l_recon = recon_loss(x, x_hat, cfg.recon_loss)
+
+        elif cfg.recon_variant == "matryoshka":
+            # Matryoshka recon = aggregate over multiple prefix reconstructions
+            ms = _resolve_matryoshka_ms(cfg)
+
+            # Compute recon loss for each prefix
+            recon_terms = []
+            for m in ms:
+                x_hat_m = _decode_prefix(sae, a_used, m)
+                recon_terms.append(recon_loss(x, x_hat_m, cfg.recon_loss))
+
+            if getattr(cfg, "matryoshka_recon_agg", "mean") == "sum":
+                l_recon = torch.stack(recon_terms).sum()
+            else:
+                l_recon = torch.stack(recon_terms).mean()
+
+            # For logging / checkpoint sanity, keep a full reconstruction too
+            # (not used for loss except insofar as full m is likely included in ms)
+            x_hat = _decode_prefix(sae, a_used, ms[-1])
+
         else:
             raise ValueError(f"Unknown recon_variant: {cfg.recon_variant}")
 
-        l_recon = recon_loss(x, x_hat, cfg.recon_loss)
+        # l_recon = recon_loss(x, x_hat, cfg.recon_loss)
 
         # -------------------------
         # Sparsity loss term (L1 modes only)
