@@ -1,0 +1,12 @@
+torch
+tqdm
+tyro
+transformer-lens
+transformers
+tokenizers
+huggingface-hub
+einops
+datasets
+matplotlib
+pandas
+mlflow

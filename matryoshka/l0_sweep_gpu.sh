@@ -13,12 +13,15 @@ SEED=0
 COMMON_ARGS=(
   --out_dir runs
   --seed "${SEED}"
-  --device mps
-  --dtype fp16
+  --device cuda
+  --dtype bf16
   --num_steps 2000
+  --batch_size 16
   --eval_num_batches 5
   --ckpt_every 2000
 )
+
+echo $COMMON_ARGS
 
 run() {
   "$@" || echo "[warn] FAILED: $*" >&2
@@ -29,7 +32,7 @@ run() {
 for lam in 2.5e-5 3e-5 3.4e-5 3.7e-5 4e-5 4.3e-5 4.7e-5 5.2e-5; do
   echo "=== l1_uniform lam=${lam} ==="
   run python3 train.py \
-    --run_name "mac_l1u_renorm_lam_${lam}" \
+    --run_name "ec2_l1u_renorm_lam_${lam}" \
     --sparsity l1_uniform \
     --lambda_base "${lam}" \
     --p_start 1.0 --p_end 1.0 \
@@ -37,17 +40,17 @@ for lam in 2.5e-5 3e-5 3.4e-5 3.7e-5 4e-5 4.3e-5 4.7e-5 5.2e-5; do
 
   echo "=== p_annealing lam=${lam} ==="
   run python3 train.py \
-    --run_name "mac_p_anneal_renorm_lam_${lam}" \
+    --run_name "ec2_p_anneal_renorm_lam_${lam}" \
     --sparsity p_annealing \
     --lambda_base "${lam}" \
     --p_start 1.0 --p_end 0.5 \
     "${COMMON_ARGS[@]}"
-
+done
 
 for lam in 6e-5 7e-5 8e-5 9e-5 1e-4 1.1e-4 1.2e-4 1.4e-4; do
   echo "=== l1_freq_weighted lam=${lam} ==="
   run python3 train.py \
-    --run_name "mac_freq_l1_renorm_lam_${lam}" \
+    --run_name "ec2_freq_l1_renorm_lam_${lam}" \
     --sparsity l1_freq_weighted \
     --lambda_base "${lam}" \
     --p_start 1.0 --p_end 1.0 \
@@ -57,7 +60,7 @@ for lam in 6e-5 7e-5 8e-5 9e-5 1e-4 1.1e-4 1.2e-4 1.4e-4; do
 
   echo "=== p_annealing_freq lam=${lam} ==="
   run python3 train.py \
-    --run_name "mac_combined_renorm_lam_${lam}" \
+    --run_name "ec2_combined_renorm_lam_${lam}" \
     --sparsity p_annealing_freq \
     --lambda_base "${lam}" \
     --p_start 1.0 --p_end 0.5 \
@@ -68,8 +71,9 @@ done
 
 echo "=== batchtopk target_l0=${TARGET_L0} ==="
 run python3 train.py \
-  --run_name "mac_batchtopk_k_${TARGET_L0}" \
+  --run_name "ec2_batchtopk_k_${TARGET_L0}" \
   --sparsity batchtopk \
   --target_l0 "${TARGET_L0}" \
   --btq_tie_break random \
   "${COMMON_ARGS[@]}"
+

@@ -175,7 +175,7 @@ class Config:
     lr: float = 3e-4
     weight_decay: float = 0.0
     grad_clip: float = 1.0
-    log_every: int = 25
+    log_every: int = 100
     ckpt_every: int = 500
 
     # ------------------------------------------------------------
@@ -190,18 +190,18 @@ class Config:
 
     # Base sparsity coefficient lambda
     lambda_base: float = 2e-5
-    
+
     # ---- P-Annealing Parameters (Idea 1) ----
     # Norm power p. For standard L1, set both to 1.0.
     # For annealing, typically p_start=1.0 -> p_end=0.5.
     p_start: float = 1.0
     p_end: float = 1.0 # change to 0.5 when running annealing experiments.
-    
-    # Annealing schedule (in steps). 
+
+    # Annealing schedule (in steps).
     # If None, defaults to 20% and 80% of num_steps respectively.
     anneal_start_step: Optional[int] = None
     anneal_end_step: Optional[int] = None
-    
+
     # Epsilon for numerical stability in concave loss: sum(|z| + eps)^p
     sparsity_eps: float = 1e-6
 
@@ -209,11 +209,11 @@ class Config:
     fw_ema_beta: float = 0.99
     fw_eps: float = 1e-4
     fw_alpha: float = 0.5
-    
+
     # Warmup: number of steps before frequency penalty applies.
     # During this period, weights are 1.0 (uniform).
     fw_warmup_steps: int = 200
-    
+
     fw_clip_min: float = 0.1     # factor (min = 0.1 * lambda_base)
     fw_clip_max: float = 10.0    # factor (max = 10 * lambda_base)
     fw_clip_relative: bool = True
@@ -228,11 +228,11 @@ class Config:
     active_threshold: float = 0.0
     redundancy_num_pairs: int = 200_000
     redundancy_high_sim: float = 0.95
-    
+
     target_l0: Optional[float] = None   # for batchtopk
     btq_eps: float = 1e-12
     btq_tie_break: Literal["none","random"] = "none"
-    
+
     matryoshka_ms: List[int] = field(default_factory=lambda: [])
     matryoshka_recon_agg: Literal["mean","sum"] = "mean"
     matryoshka_include_full: bool = True
