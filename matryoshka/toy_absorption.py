@@ -21,6 +21,24 @@ from eval_metrics import avg_max_decoder_cosine_similarity
 # Toy data: parent + children
 # ----------------------------
 
+@dataclass
+class ToyTreeSpec:
+    """Simple 2-level tree: one parent feature + C child features.
+
+    Each example contains:
+      - parent always on (amplitude ~1)
+      - with probability child_prob, one random child is on (amplitude ~1)
+      - optionally: a small amount of gaussian noise
+    """
+    d_model: int = 256
+    n_children: int = 8
+    n_train: int = 50_000
+    n_eval: int = 10_000
+    child_prob: float = 0.3
+    noise_std: float = 0.02
+    seed: int = 0
+
+
 @torch.no_grad()
 def make_orthonormal_features(
     d_model: int,
@@ -41,52 +59,41 @@ def make_orthonormal_features(
     return Q.t().contiguous()  # [n_feats, d]
 
 
-
-@dataclass
-class ToyTreeSpec:
-    """Simple 2-level tree: one parent feature + C child features.
-
-    Each example contains:
-      - parent always on (amplitude ~1)
-      - with probability child_prob, one random child is on (amplitude ~1)
-      - optionally: a small amount of gaussian noise
-    """
-    d_model: int = 256
-    n_children: int = 8
-    n_train: int = 50_000
-    n_eval: int = 10_000
-    child_prob: float = 0.3
-    noise_std: float = 0.02
-    seed: int = 0
-
-# @torch.no_grad()
-# def make_orthonormal_features(d_model: int, n_feats: int, device: torch.device, generator: Optional[torch.Generator] = None) -> torch.Tensor:
-#     X = torch.randn(n_feats, d_model, device=device, generator=generator)
-#     Q, _ = torch.linalg.qr(X.t(), mode="reduced")
-#     return Q.t().contiguous()
-
 @torch.no_grad()
-def sample_tree_batch(U: torch.Tensor, spec: ToyTreeSpec, n: int, device: torch.device) -> Tuple[torch.Tensor, torch.Tensor]:
-    parent = U[0]
-    children = U[1:]
+def sample_tree_batch(
+    U: torch.Tensor,  # [1 + C, d_model] feature directions
+    spec: ToyTreeSpec,
+    n: int,
+    device: torch.device,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Generate x and binary indicators of which child was active.
+
+    Returns:
+      x: [n, d_model]
+      child_idx: [n] with -1 meaning no child active, else in [0..C-1]
+    """
+    parent = U[0]            # [d]
+    children = U[1:]         # [C, d]
     C = children.shape[0]
+
     parent_amp = torch.ones(n, device=device)
+
     has_child = torch.rand(n, device=device) < spec.child_prob
     child_idx = torch.full((n,), -1, device=device, dtype=torch.long)
     if has_child.any():
         child_idx[has_child] = torch.randint(0, C, (int(has_child.sum().item()),), device=device)
+
     child_amp = torch.zeros(n, device=device)
     child_amp[has_child] = 1.0
-    x = parent_amp.unsqueeze(1) * parent.unsqueeze(0)
+
+    x = parent_amp.unsqueeze(1) * parent.unsqueeze(0)  # [n, d]
     if has_child.any():
         x[has_child] += child_amp[has_child].unsqueeze(1) * children[child_idx[has_child]]
+
     if spec.noise_std > 0:
         x = x + spec.noise_std * torch.randn_like(x)
-    return x.to(torch.float32), child_idx
 
-# ----------------------------
-# Penalty selection (toy uses same sparsity knob)
-# ----------------------------
+    return x.to(torch.float32), child_idx
 
 
 # ----------------------------
@@ -127,7 +134,7 @@ def make_penalty(cfg: Config, device: torch.device):
         )
 
     if cfg.sparsity == "batchtopk":
-        raise ValueError("toy: sparsity='batchtopk' not implemented yet.")
+        raise ValueError("toy: sparsity='batchtopk' not implemented yet (later commit).")
 
     raise ValueError(f"Unknown sparsity: {cfg.sparsity}")
 
@@ -155,23 +162,6 @@ def latent_active_freq(a: torch.Tensor, thresh: float = 0.0) -> torch.Tensor:
     if a.numel() == 0:
         return torch.zeros((a.shape[-1],), device=a.device, dtype=torch.float32)
     return (a > thresh).float().mean(dim=0).to(torch.float32)
-
-
-# @torch.no_grad()
-# def avg_max_decoder_cos(W_dec: torch.Tensor, chunk: int = 2048) -> float:
-#     W = normalize_decoder_rows(W_dec).to(torch.float32)
-#     K = W.shape[0]
-#     if K < 2:
-#         return 0.0
-#     WT = W.t().contiguous()
-#     max_per = torch.full((K,), -1.0, device=W.device)
-#     for i0 in range(0, K, chunk):
-#         i1 = min(K, i0 + chunk)
-#         sims = W[i0:i1] @ WT
-#         rows = torch.arange(i0, i1, device=W.device)
-#         sims[torch.arange(i1 - i0, device=W.device), rows] = -1e9
-#         max_per[i0:i1] = sims.max(dim=1).values
-#     return float(max_per.clamp(-1, 1).mean().item())
 
 
 # ----------------------------
@@ -512,6 +502,7 @@ def _train_one(
     show_progress: bool,
     seed_offset: int = 1,
 ) -> SparseAutoencoder:
+    # Re-seed so lambda sweeps are comparable (same init & data randomness per candidate)
     train_seed = int(spec.seed) + int(seed_offset)
     torch.manual_seed(train_seed)
     random.seed(train_seed)
@@ -526,28 +517,38 @@ def _train_one(
     )
 
     penalty = make_penalty(cfg, device=device)
+
     opt = torch.optim.AdamW(sae.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
+
     sae.train()
     bs = cfg.batch_size
-    
+
     it = range(steps)
-    pbar = tqdm(it, desc=f"toy train [{cfg.sparsity}]", dynamic_ncols=True) if show_progress else it
+    pbar = (
+        tqdm(it, desc=f"toy train [{cfg.sparsity}] lam={cfg.lambda_base:.2e}", dynamic_ncols=True)
+        if show_progress else it
+    )
 
     for step in pbar:
         x, _ = sample_tree_batch(U, spec, n=bs, device=device)
         out = sae(x)
         a = out.a
 
+        # Recon path
         if cfg.recon_variant == "standard":
             x_hat = out.x_hat
             l_recon = torch.mean((x - x_hat) ** 2)
+
         elif cfg.recon_variant == "matryoshka":
             ms = _resolve_matryoshka_ms(cfg)
             recon_terms = []
             for m in ms:
                 x_hat_m = _decode_prefix(sae, a, m)
                 recon_terms.append(torch.mean((x - x_hat_m) ** 2))
-            l_recon = torch.stack(recon_terms).mean()
+            if getattr(cfg, "matryoshka_recon_agg", "mean") == "sum":
+                l_recon = torch.stack(recon_terms).sum()
+            else:
+                l_recon = torch.stack(recon_terms).mean()
         else:
             raise ValueError(cfg.recon_variant)
 
@@ -564,8 +565,13 @@ def _train_one(
                 lam=f"{sparse_stats.get('lambda_mean', cfg.lambda_base):.2e}",
                 p=f"{sparse_stats.get('p_current', 1.0):.2f}"
             )
-    
+
+    if show_progress:
+        # pbar.close() # handled by context or loop end
+        pass
+
     return sae
+
 
 def _default_lambda_grid(center: float) -> List[float]:
     """
@@ -593,14 +599,13 @@ def _pick_lambda_via_sweep(
     assert cfg.target_l0 is not None
     target = float(cfg.target_l0)
 
-    # Candidates: use config grid or default
+    # Candidates: either provided externally (via config) or a reasonable default grid
     cand: Optional[List[float]] = getattr(cfg, "toy_lambda_grid", None)
     if cand is None:
         cand = _default_lambda_grid(cfg.lambda_base)
 
     # IMPORTANT: The sweep must run for the full duration (cfg.num_steps) 
     # because P-Annealing and Frequency Weighting change dynamics over time.
-    # If we only ran a short sweep, we'd calibrate for p=1.0 (start), not p=0.5 (end).
     sweep_steps = cfg.num_steps 
     
     l0_eval_bs = max(512, cfg.batch_size)
@@ -615,7 +620,6 @@ def _pick_lambda_via_sweep(
     for lam in cand:
         cfg_s = replace(cfg, lambda_base=float(lam))
         
-        # Train full run for this candidate
         sae_s = _train_one(
             cfg_s,
             U=U,
@@ -627,6 +631,7 @@ def _pick_lambda_via_sweep(
         )
 
         with torch.no_grad():
+            # Evaluate L0 on a few fresh batches
             cur_l0 = measure_l0_on_toy(
                 sae_s, U, spec,
                 device=device,
@@ -634,8 +639,8 @@ def _pick_lambda_via_sweep(
                 batch_size=l0_eval_bs,
                 thresh=cfg.active_threshold,
             )
-            
-            # Quick FVU check for tie-breaking
+
+            # Lightweight FVU estimate (tie-break)
             x_tmp, _ = sample_tree_batch(U, spec, n=spec.n_eval, device=device)
             out_tmp = sae_s(x_tmp)
             if cfg_s.recon_variant == "matryoshka":
@@ -648,12 +653,14 @@ def _pick_lambda_via_sweep(
         err = abs(cur_l0 - target)
         print(f"   lam={lam:.1e} -> L0={cur_l0:.2f} (err={err:.2f})")
 
+        # Choose minimal L0 error; tie-break by lower FVU
         if (err < best_err) or (abs(err - best_err) < 1e-9 and cur_fvu < best_fvu):
             best_err = err
             best_fvu = cur_fvu
             best_lam = float(lam)
 
     return best_lam
+
 
 # ----------------------------
 # Main toy runner
@@ -675,10 +682,9 @@ def run_toy(cfg: Config, spec: ToyTreeSpec, device: torch.device) -> Dict[str, f
     U_parent = U[0].to(torch.float32)  # [d], unit from QR construction
 
     # Seed offset used for training RNG stream (init + batch sampling).
-    # Default offset=1 breaks coupling between U generation and SAE init/data RNG.
     seed_offset = int(getattr(cfg, "toy_train_seed_offset", 1))
 
-    # If calibrate_l0 is enabled, do an offline lambda sweep (L1 modes only)
+    # --- UPDATED: Check for all new sparsity modes ---
     do_sweep = (
         cfg.calibrate_l0
         and (cfg.target_l0 is not None)
@@ -833,10 +839,12 @@ def run_toy(cfg: Config, spec: ToyTreeSpec, device: torch.device) -> Dict[str, f
         # Match quality diagnostics (are matched latents alive?)
         "parent_lat_p_active": float(parent_p_cos),
         "parent_lat_p_active_contrib": float(parent_p_contrib),
+        
         "child_lat_p_mean": float(child_freq_cos["child_lat_p_mean"]),
         "child_lat_p_min": float(child_freq_cos["child_lat_p_min"]),
         "child_lat_p_max": float(child_freq_cos["child_lat_p_max"]),
         "child_lat_unique": float(child_freq_cos["child_lat_unique"]),
+        
         "child_lat_p_mean_contrib": float(child_freq_contrib["child_lat_p_mean"]),
         "child_lat_p_min_contrib": float(child_freq_contrib["child_lat_p_min"]),
         "child_lat_p_max_contrib": float(child_freq_contrib["child_lat_p_max"]),
@@ -865,7 +873,9 @@ def run_toy(cfg: Config, spec: ToyTreeSpec, device: torch.device) -> Dict[str, f
 
         # Run metadata
         "lambda_base": float(cfg.lambda_base),
-        "recon_variant": float(0.0),  # keep numeric-only if you want (or remove)
+        "p_start": float(cfg.p_start),
+        "p_end": float(cfg.p_end),
+        "fw_alpha": float(cfg.fw_alpha) if "freq" in cfg.sparsity else 0.0,
     }
 
 
@@ -887,16 +897,32 @@ def main() -> None:
 
     results: Dict[str, Dict[str, float]] = {}
 
-    def run_one(tag: str, recon_variant: str, sparsity: str):
-        cfg_i = replace(cfg, recon_variant=recon_variant, sparsity=sparsity)
-        results[tag] = run_toy(cfg=cfg_i, spec=spec, device=device)
+    def run_one(tag: str, recon_variant: str, sparsity: str, **kwargs):
+        # Helper to override params (e.g., enable p-annealing)
+        cfg_i = replace(cfg, recon_variant=recon_variant, sparsity=sparsity, **kwargs)
+        print(f"--- Running {tag} ---")
+        try:
+            results[tag] = run_toy(cfg=cfg_i, spec=spec, device=device)
+        except Exception as e:
+            print(f"FAILED {tag}: {e}")
+            import traceback
+            traceback.print_exc()
 
+    # 1. Baseline
     run_one("standard_l1_uniform", "standard", "l1_uniform")
-    run_one("standard_l1_freq_weighted", "standard", "l1_freq_weighted")
-    run_one("stoch_avail_l1_uniform", "stoch_avail", "l1_uniform")
+    
+    # 2. Idea 1: P-Annealing (1.0 -> 0.5)
+    run_one("standard_anneal", "standard", "p_annealing", p_start=1.0, p_end=0.5)
+    
+    # 3. Idea 2: Freq Weighted
+    run_one("standard_freq", "standard", "l1_freq_weighted")
+    
+    # 4. Combined
+    run_one("standard_combined", "standard", "p_annealing_freq", p_start=1.0, p_end=0.5)
 
+    # 5. Matryoshka Comparisons
     run_one("matryoshka_l1_uniform", "matryoshka", "l1_uniform")
-    run_one("matryoshka_l1_freq_weighted", "matryoshka", "l1_freq_weighted")
+    run_one("matryoshka_combined", "matryoshka", "p_annealing_freq", p_start=1.0, p_end=0.5)
 
     out_path = Path(cfg.out_dir) / f"toy_absorption_{cfg.run_name}.json"
     out_path.parent.mkdir(parents=True, exist_ok=True)

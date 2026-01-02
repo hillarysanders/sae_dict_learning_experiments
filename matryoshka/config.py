@@ -16,20 +16,116 @@ DType = Literal["auto", "fp32", "fp16", "bf16"]
 
 ReconVariant = Literal["standard", "matryoshka"]
 
-# Sparsity objectives:
-# - "l1_uniform": Standard L1 (p=1.0 fixed, uniform weights)
-# - "l1_freq_weighted": L1 with frequency weights (p=1.0 fixed)
-# - "p_annealing": Uniform weights, p anneals from p_start -> p_end
-# - "p_annealing_freq": Frequency weights, p anneals from p_start -> p_end
-# - "batchtopk": Hard sparsity constraint
+# Sparsity objectives
+#
+# This repo is testing two knobs that both aim to reduce “feature splitting” / redundancy while
+# keeping recon quality acceptable:
+#
+# This repo is centered on two experimental ideas:
+#
+#   Idea 1: Concave sparsity via curriculum (a.k.a. "P‑annealing")
+#   ----------------------------------------------------------------
+#   Replace the usual convex L1 penalty with an Lp penalty where p < 1
+#   (e.g. p=0.5 behaves like sqrt), which is “closer” to L0 in spirit.
+#
+#       L_sparse(a) ~ sum_i (|a_i| + eps)^p
+#
+#   For p < 1, this is concave / non‑convex. The intuition is:
+#     • encourages fewer *active* latents per example (more “winner-take-most”)
+#     • tends to concentrate mass into fewer latents instead of many small ones
+#     • can improve interpretability but can be harder / “stickier” to train
+#
+#   To mitigate training pathologies, we *do not* jump straight to p<1:
+#     • start at p_start = 1.0 (standard L1; stable gradients early)
+#     • anneal linearly to p_end < 1 (e.g. 0.5) after the dictionary starts forming
+#     • annealing window: [anneal_start_step, anneal_end_step]
+#       (defaults: 20% → 80% of num_steps if unspecified)
+#
+#   Note on eps:
+#     We add `sparsity_eps` inside the power: (|a| + eps)^p.
+#     This avoids numerical instability / extreme gradients near zero when p<1.
+#
+#
+#   Idea 2: Frequency‑weighted sparsity (TF‑IDF‑inspired weighting)
+#   ----------------------------------------------------------------
+#   Maintain an EMA of each latent’s activation frequency:
+#
+#       freq_i ≈ P[a_i > 0]
+#
+#   Then scale the per‑latent sparsity coefficient:
+#
+#       lambda_i = lambda_base * w_i
+#       w_i ∝ (freq_i + fw_eps)^(-alpha)
+#
+#   In the CURRENT implementation (see FrequencyWeightedLpPenalty):
+#     • common latents (high freq_i) get *smaller* lambda_i  → cheaper to use
+#     • rare latents   (low  freq_i) get *larger*  lambda_i  → more expensive to use
+#
+#   Why this matches the write-up’s “TF‑IDF / common concepts are easy to ignore” framing:
+#     • common factors can be represented without the model “gaming” the sparsity cost
+#       by splitting them into many fragments (since common latents are discounted anyway)
+#     • rare latents are preserved for genuinely “surprising / informative” concepts
+#     • at interpretation time, you can still downweight common latents (TF‑IDF-style)
+#       without forcing training-time sparsity to over-fragment common phenomena
+#
+#   (If you ever want the *opposite* behavior—penalize common latents MORE than rare ones—
+#    you’d invert the weighting scheme, e.g. use w_i ∝ (freq_i + eps)^(+alpha) or flip alpha.
+#    The current modes are explicitly testing the “discount common / penalize rare” direction.)
+#
+#   Practical details:
+#     • fw_warmup_steps: for the first N steps, all lambdas are uniform = lambda_base
+#       (helps stabilize early learning while EMA frequencies are noisy)
+#     • fw_clip_min/max: clamp lambda_i to avoid extreme weights
+#     • fw_normalize_mean: normalize w so mean(w)=1 (keeps lambda_base comparable)
+#
+#
+# What each cfg.sparsity mode is testing
+# -------------------------------------
+# 1) "l1_uniform"  (Baseline)
+#    - Pure L1 sparsity: p fixed at 1.0, uniform weighting over latents.
+#    - This is the control condition: neither Idea 1 nor Idea 2 is active.
+#    - Useful for: baseline FVU vs L0 tradeoff, redundancy, dead features, etc.
+#
+# 2) "l1_freq_weighted"  (Idea 2 only)
+#    - p fixed at 1.0 (still convex L1-like shape),
+#      but lambda_i varies per latent based on EMA frequency.
+#    - Tests: does frequency-weighted penalty reduce “bad feature splitting”
+#      / improve interpretability at a given reconstruction quality?
+#
+# 3) "p_annealing"  (Idea 1 only)
+#    - Uniform weights, but p anneals from p_start -> p_end over training.
+#    - Tests: can we safely introduce concavity later in training to get more
+#      per-example sparsity (closer to L0 behavior) without early-training instability?
+#
+# 4) "p_annealing_freq"  (Idea 1 + Idea 2 combined)
+#    - Combines both mechanisms:
+#        • concave sparsity pressure late in training (Idea 1)
+#        • frequency-dependent lambda_i (Idea 2)
+#    - Tests: synergy. The intended effect is:
+#        • concavity encourages fewer active latents per example
+#        • freq-weighting makes common “boring” latents cheap, so the model
+#          is less incentivized to fragment common factors just to reduce penalty
+#
+# 5) "batchtopk"  (Reference / alternative to concave penalties)
+#    - Not a penalty; it’s a hard gating constraint applied to activations.
+#      We keep only the globally top activations across the batch such that:
+#         average L0 per row ≈ target_l0
+#    - Pros: avoids directly optimizing a concave objective.
+#    - Cons: masked latents get zero gradient (risk of dead latents unless you add
+#      auxiliary mechanisms). Included mainly as a comparison point vs Idea 1’s
+#      “trainable concavity” approach.
+#
+# Hyperparameter note:
+#   - Penalty-based modes ("l1_*", "*annealing*") primarily tune lambda_base
+#     (optionally calibrated to a target L0).
+#   - "batchtopk" primarily tunes target_l0 (and optionally a threshold theta for eval).
 Sparsity = Literal[
-    "l1_uniform", 
-    "l1_freq_weighted", 
-    "p_annealing", 
-    "p_annealing_freq", 
-    "batchtopk"
+    "l1_uniform",
+    "l1_freq_weighted",
+    "p_annealing",
+    "p_annealing_freq",
+    "batchtopk",
 ]
-
 
 @dataclass
 class Config:
