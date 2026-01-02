@@ -96,3 +96,19 @@ def normalize_decoder_rows(W_dec: torch.Tensor, eps: float = 1e-8) -> torch.Tens
     """Return row-normalized decoder vectors for cosine similarity computations."""
     norms = W_dec.norm(dim=1, keepdim=True).clamp_min(eps)
     return W_dec / norms
+
+
+@torch.no_grad()
+def renorm_decoder_rows_(
+    sae: "SparseAutoencoder",
+    eps: float = 1e-8,
+) -> torch.Tensor:
+    """In-place: force each decoder row (latent direction) to unit norm.
+
+    Returns:
+        norms_pre: [K] row norms before renorm (useful for logging).
+    """
+    W = sae.W_dec  # [K, d_model]
+    norms_pre = W.norm(dim=1)  # [K]
+    W.div_(norms_pre.clamp_min(eps).unsqueeze(1))
+    return norms_pre

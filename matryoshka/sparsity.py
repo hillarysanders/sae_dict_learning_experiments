@@ -98,23 +98,32 @@ class FrequencyWeightedLpPenalty(SparsityPenalty):
         # Define "active" as >0 (for ReLU). Detached by no_grad.
         batch_p = (a > 0).float().mean(dim=0)
         self.ema_p.mul_(self.ema_beta).add_((1.0 - self.ema_beta) * batch_p)
-
+        
     def current_lambdas(self, step: int) -> torch.Tensor:
-        # During warmup, use uniform lambda
         if step < self.warmup_steps:
             return torch.full_like(self.ema_p, self.lambda_base)
 
         # Calculate frequency weights
-        # w ~ 1 / (freq + eps)^alpha
-        # High freq -> Low weight (discount)
-        # Low freq -> High weight (penalty)
         w = (self.ema_p + self.fw_eps).pow(-self.alpha).detach()
-        
+
         if self.normalize_mean:
             w = w / w.mean().clamp_min(1e-12)
 
-        lam = (self.lambda_base * w).clamp(self.clip_min, self.clip_max)
-        return lam
+        lam_raw = self.lambda_base * w
+
+        # Clip (relative or absolute)
+        if getattr(self, "clip_relative", True):
+            clip_min = self.lambda_base * float(self.clip_min)
+            clip_max = self.lambda_base * float(self.clip_max)
+        else:
+            clip_min = float(self.clip_min)
+            clip_max = float(self.clip_max)
+
+        if clip_min > clip_max:
+            clip_min, clip_max = clip_max, clip_min
+
+        return lam_raw.clamp(clip_min, clip_max)
+
 
     def compute(self, a: torch.Tensor, step: int) -> tuple[torch.Tensor, Dict[str, float]]:
         # 1. Update frequency statistics (Idea 2)

@@ -189,13 +189,13 @@ class Config:
     sparsity: Sparsity = "l1_uniform"
 
     # Base sparsity coefficient lambda
-    lambda_base: float = 1e-3
-
+    lambda_base: float = 2e-5
+    
     # ---- P-Annealing Parameters (Idea 1) ----
     # Norm power p. For standard L1, set both to 1.0.
     # For annealing, typically p_start=1.0 -> p_end=0.5.
     p_start: float = 1.0
-    p_end: float = 1.0
+    p_end: float = 1.0 # change to 0.5 when running annealing experiments.
     
     # Annealing schedule (in steps). 
     # If None, defaults to 20% and 80% of num_steps respectively.
@@ -214,10 +214,13 @@ class Config:
     # During this period, weights are 1.0 (uniform).
     fw_warmup_steps: int = 200
     
-    fw_clip_min: float = 1e-4
-    fw_clip_max: float = 1e-2
+    fw_clip_min: float = 0.1     # factor (min = 0.1 * lambda_base)
+    fw_clip_max: float = 10.0    # factor (max = 10 * lambda_base)
+    fw_clip_relative: bool = True
     fw_normalize_mean: bool = True
 
+    decoder_unit_norm: bool = True
+    decoder_unit_norm_eps: float = 1e-8
     # ============================================================
     # Evaluation settings
     # ============================================================

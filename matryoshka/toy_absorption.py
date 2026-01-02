@@ -12,6 +12,7 @@ import torch
 from tqdm import tqdm
 
 from config import Config
+from sae import SparseAutoencoder, normalize_decoder_rows, renorm_decoder_rows_
 from sae import SparseAutoencoder, normalize_decoder_rows
 from sparsity import UniformLpPenalty, FrequencyWeightedLpPenalty
 from matryoshka_utils import _resolve_matryoshka_ms, _decode_prefix
@@ -559,6 +560,9 @@ def _train_one(
         loss.backward()
         opt.step()
 
+        if getattr(cfg, "decoder_unit_norm", False):
+            renorm_decoder_rows_(sae, eps=getattr(cfg, "decoder_unit_norm_eps", 1e-8))
+            
         if show_progress and (step % max(1, cfg.log_every) == 0):
             pbar.set_postfix(
                 loss=f"{loss.item():.3e}",

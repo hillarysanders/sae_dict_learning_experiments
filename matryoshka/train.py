@@ -14,6 +14,7 @@ from typing import Dict
 import torch
 from tqdm import tqdm
 from dataclasses import replace
+from sae import SparseAutoencoder, recon_loss, renorm_decoder_rows_
 from eval_metrics import calibrate_lambda_for_target_l0
 from calibration import calibrate_theta_for_target_l0, estimate_l0_with_theta
 from config import Config, make_run_dir, save_config
@@ -210,6 +211,13 @@ def train(cfg: Config) -> Path:
             torch.nn.utils.clip_grad_norm_(sae.parameters(), cfg.grad_clip)
 
         opt.step()
+        
+        # Baseline alignment: constrain decoder directions to unit norm
+        dec_norms_pre = None
+        if getattr(cfg, "decoder_unit_norm", False):
+            dec_norms_pre = renorm_decoder_rows_(
+                sae, eps=getattr(cfg, "decoder_unit_norm_eps", 1e-8)
+            )
 
         # ---- Logging ----
         if step == 1 or step % 5 == 0:
@@ -245,7 +253,11 @@ def train(cfg: Config) -> Path:
             }
             row.update({k: float(v) for k, v in bt_stats.items()})
             row.update({k: float(v) for k, v in sparse_stats.items()})
-
+            
+            if dec_norms_pre is not None:
+                row["wdec_norm_pre_mean"] = float(dec_norms_pre.mean().item())
+                row["wdec_norm_pre_max"] = float(dec_norms_pre.max().item())
+            
             f_metrics.write(json.dumps(row) + "\n")
             f_metrics.flush()
 
