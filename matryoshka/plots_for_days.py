@@ -56,6 +56,83 @@ from eval_metrics import run_quick_eval
 # ---------------------------
 # Helpers: IO + parsing
 # ---------------------------
+# ---------------------------
+# Pretty labels for plots
+# ---------------------------
+
+_METRIC_INFO: Dict[str, Dict[str, str]] = {
+    # headline metrics
+    "fvu": {
+        "name": "Fraction of Variance Unexplained (FVU)",
+        "better": "lower",
+        "desc": "Reconstruction error proxy",
+    },
+    "l0_mean": {
+        "name": "Average # Active Latents per Token (L0 mean)",
+        "better": "context",  # neither always better; target-matched in your report
+        "desc": "Sparsity level",
+    },
+    "avg_max_decoder_cos": {
+        "name": "Avg Max Cosine to Other Latents",
+        "better": "lower",
+        "desc": "Near-duplicate feature proxy",
+    },
+    "dead_frac_p_lt_1e_6": {
+        "name": "Dead Latent Fraction (p < 1e-6)",
+        "better": "lower",
+        "desc": "Latents essentially never used",
+    },
+    "rare_frac_p_lt_1e_4": {
+        "name": "Rare Latent Fraction (p < 1e-4)",
+        "better": "lower",
+        "desc": "Latents very rarely used",
+    },
+
+    # schedules
+    "p_current": {
+        "name": "Lp Exponent p (1.0=L1, 0.5≈sqrt)",
+        "better": "context",
+        "desc": "Sparsity curvature schedule",
+    },
+    "lambda_mean": {
+        "name": "Mean Per-Latent Sparsity Weight (λ mean)",
+        "better": "context",
+        "desc": "Frequency-weighted penalty scale",
+    },
+    "lambda_min": {
+        "name": "Min Per-Latent Sparsity Weight (λ min)",
+        "better": "context",
+        "desc": "Cheapest latent penalty",
+    },
+    "lambda_max": {
+        "name": "Max Per-Latent Sparsity Weight (λ max)",
+        "better": "context",
+        "desc": "Most expensive latent penalty",
+    },
+}
+
+def pretty_metric(metric: str) -> str:
+    return _METRIC_INFO.get(metric, {}).get("name", metric)
+
+def better_text(metric: str) -> str:
+    better = _METRIC_INFO.get(metric, {}).get("better", "context")
+    if better == "lower":
+        return "lower is better"
+    if better == "higher":
+        return "higher is better"
+    return "target-dependent"
+
+def axis_label(metric: str) -> str:
+    # Keep this short-ish for axes
+    bt = better_text(metric)
+    return f"{pretty_metric(metric)}\n({bt})"
+
+def title_with_tip(title: str, metric: Optional[str] = None) -> str:
+    if metric is None:
+        return title
+    bt = better_text(metric)
+    return f"{title} — {bt}"
+
 
 def _safe_read_json(path: Path) -> Dict[str, Any]:
     return json.loads(path.read_text())
@@ -240,9 +317,12 @@ def plot_toy_pareto(rows: List[Dict[str, Any]], out_dir: Path) -> None:
         mean_ys.append(my)
         mean_labels.append(tag)
 
-    ax.set_xlabel("FVU (lower better)")
-    ax.set_ylabel("AvgMax decoder cosine (lower better)")
+    # ax.set_xlabel("FVU (lower better)")
+    # ax.set_ylabel("AvgMax decoder cosine (lower better)")
     ax.set_title("Toy: Redundancy vs Reconstruction (means + per-run scatter)")
+    ax.set_xlabel(axis_label("fvu"))
+    ax.set_ylabel(axis_label("avg_max_decoder_cos"))
+
     _annotate_points(ax, mean_xs, mean_ys, mean_labels, max_labels=60)
     ax.legend(loc="best", fontsize=8)
     _savefig(out_dir / "toy_pareto_redundancy_vs_fvu.png")
@@ -303,6 +383,7 @@ def plot_toy_absorption_vs_l0(rows: List[Dict[str, Any]], out_dir: Path) -> None
     ax.set_xlabel("L0 mean (avg active latents)")
     ax.set_ylabel("Absorption rate (latent contrib match) (lower better)")
     ax.set_title("Toy: Absorption vs Sparsity (means + per-run scatter)")
+
     _annotate_points(ax, mean_xs, mean_ys, mean_labels, max_labels=60)
     ax.legend(loc="best", fontsize=8)
     _savefig(out_dir / "toy_absorption_vs_l0.png")
@@ -390,8 +471,10 @@ def plot_end_eval_bars(
     ax.bar(x, means, yerr=stds if any(s > 0 for s in stds) else None, capsize=4)
     ax.set_xticks(x)
     ax.set_xticklabels(names, rotation=30, ha="right")
-    ax.set_ylabel(metric)
-    ax.set_title(title or f"End-of-run: {metric} (mean ± std)")
+    # ax.set_ylabel(metric)
+    ax.set_ylabel(axis_label(metric))
+    ax.set_title(title or f"End of run: {pretty_metric(metric)} — {better_text(metric)}\n(mean ± std)")
+    # ax.set_title(title or f"End-of-run: {metric} (mean ± std)")
     _savefig(out_dir / f"end_eval_{metric}.png")
 
 
@@ -405,30 +488,61 @@ def eval_checkpoints_for_run_dir(
     device_override: Optional[str],
     dtype_override: Optional[str],
     eval_num_batches_override: Optional[int],
+    recompute_cached: bool,
 ) -> Tuple[List[int], List[Dict[str, float]]]:
     """
-    Evaluate run_quick_eval at each checkpoint in run_dir.
+    Evaluate run_quick_eval at each checkpoint in run_dir, with caching.
+
+    Fast path:
+      - If all requested checkpoint steps are already cached (and not forcing recompute),
+        return cached results WITHOUT loading the large TL model.
 
     Returns:
         steps: list[int]
-        evals: list[dict]
+        evals: list[dict[str, float]]
     """
     ckpts = _list_checkpoints(run_dir)
     if not ckpts:
         raise RuntimeError(f"No checkpoints found in {run_dir}")
 
-    # Load one checkpoint to get cfg + d_model
+    # Load one checkpoint to get cfg (CPU-only, cheap relative to TL model load)
     ck0 = torch_load(ckpts[0])
     cfg_dict = ck0.get("cfg", {})
     cfg = _cfg_from_dict(cfg_dict)
 
-    # Allow user override for plotting-time device/dtype
-    device = pick_device(device_override or cfg.device)
-    dtype = pick_dtype(dtype_override or cfg.dtype, device)
-
-    # Override eval batch count to keep plots fast if desired
+    # Override eval batch count BEFORE computing cache_key
     if eval_num_batches_override is not None:
         cfg.eval_num_batches = int(eval_num_batches_override)
+
+    # Load cache early
+    cache = _load_ckpt_eval_cache(run_dir)
+    cache_key = f"eval_num_batches={cfg.eval_num_batches}|model={cfg.model_name}|hook={cfg.resolved_hook()}"
+    cache.setdefault("meta", {})
+    cache.setdefault("series", {})
+    cache["meta"][cache_key] = cache["meta"].get(cache_key, {"created_by": "make_plots.py"})
+    series = cache["series"].setdefault(cache_key, {})  # step(str) -> metrics dict
+
+    # Determine which steps are needed
+    want_steps = [_checkpoint_step(p) for p in ckpts]
+    want_steps = [s for s in want_steps if s >= 0]
+
+    if recompute_cached:
+        need_steps = set(want_steps)
+    else:
+        need_steps = {s for s in want_steps if str(s) not in series}
+
+    # Fast path: everything is cached -> return without loading TL model
+    if not need_steps:
+        out_steps = sorted(want_steps)
+        out_evals: List[Dict[str, float]] = []
+        for s in out_steps:
+            row = series.get(str(s), {})
+            out_evals.append({k: float(v) for k, v in row.items()})
+        return out_steps, out_evals
+
+    # Only now do we pay the cost of model/device setup
+    device = pick_device(device_override or cfg.device)
+    dtype = pick_dtype(dtype_override or cfg.dtype, device)
 
     model = load_tl_model(cfg.model_name, device=device, dtype=dtype)
     hook_name = cfg.resolved_hook()
@@ -438,6 +552,15 @@ def eval_checkpoints_for_run_dir(
 
     for ck in ckpts:
         step = _checkpoint_step(ck)
+        if step < 0:
+            continue
+
+        # If cached, skip expensive eval (unless forced)
+        if (not recompute_cached) and (str(step) in series):
+            steps.append(step)
+            evals.append({k: float(v) for k, v in series[str(step)].items()})
+            continue
+
         data = torch_load(ck)
         d_model = int(data["d_model"])
         state_dict = data["state_dict"]
@@ -454,143 +577,370 @@ def eval_checkpoints_for_run_dir(
         sae.eval()
 
         out = run_quick_eval(cfg, sae, model=model, hook_name=hook_name, theta=None)
-        steps.append(step)
-        evals.append({k: float(v) for k, v in out.items() if isinstance(v, (int, float))})
+        row = {k: float(v) for k, v in out.items() if isinstance(v, (int, float))}
 
-        print(f"[ckpt eval] {run_dir.name} step={step} -> "
-              f"fvu={out.get('fvu', float('nan')):.4f} "
-              f"l0={out.get('l0_mean', float('nan')):.2f} "
-              f"cos={out.get('avg_max_decoder_cos', float('nan')):.4f}")
+        # write to cache + persist
+        series[str(step)] = row
+        _save_ckpt_eval_cache(run_dir, cache)
+
+        steps.append(step)
+        evals.append(row)
+
+        print(
+            f"[ckpt eval] {run_dir.name} step={step} -> "
+            f"fvu={row.get('fvu', float('nan')):.4f} "
+            f"l0={row.get('l0_mean', float('nan')):.2f} "
+            f"cos={row.get('avg_max_decoder_cos', float('nan')):.4f}"
+        )
 
     return steps, evals
+
 
 
 def plot_train_dashboard_over_checkpoints(
     run_label_to_series: Dict[str, Tuple[List[int], List[Dict[str, float]]]],
     out_dir: Path,
 ) -> None:
-    """
-    Creates three separate plots:
-      - fvu vs step
-      - l0_mean vs step
-      - avg_max_decoder_cos vs step
-    """
-    for metric, ylabel, fname, title in [
-        ("fvu", "FVU (lower better)", "train_dashboard_fvu_vs_step.png", "Train (checkpoints): FVU vs step"),
-        ("l0_mean", "L0 mean (avg actives per token)", "train_dashboard_l0_vs_step.png", "Train (checkpoints): L0 vs step"),
-        ("avg_max_decoder_cos", "AvgMax decoder cosine (lower better)", "train_dashboard_cos_vs_step.png", "Train (checkpoints): Decoder redundancy vs step"),
+    base_to_color = _assign_colors_by_base(run_label_to_series.keys())
+
+    # Group series by base method name
+    base_to_runs: Dict[str, List[Tuple[List[int], List[Dict[str, float]]]]] = {}
+    for label, (steps, evals) in run_label_to_series.items():
+        base_to_runs.setdefault(_base_label(label), []).append((steps, evals))
+
+    def _mean_series_for_metric(
+        runs: List[Tuple[List[int], List[Dict[str, float]]]], metric: str
+    ) -> Tuple[List[int], List[float]]:
+        # step -> list of metric values from all runs that have it
+        step_to_vals: Dict[int, List[float]] = {}
+        for steps, evals in runs:
+            for s, e in zip(steps, evals):
+                v = e.get(metric, float("nan"))
+                if v is None or (isinstance(v, float) and math.isnan(v)):
+                    continue
+                step_to_vals.setdefault(int(s), []).append(float(v))
+
+        mean_steps = sorted(step_to_vals.keys())
+        mean_vals = [sum(step_to_vals[s]) / len(step_to_vals[s]) for s in mean_steps]
+        return mean_steps, mean_vals
+
+    for metric, fname in [
+        ("fvu", "train_dashboard_fvu_vs_step.png"),
+        ("l0_mean", "train_dashboard_l0_vs_step.png"),
+        ("avg_max_decoder_cos", "train_dashboard_decoder_redundancy_vs_step.png"),
     ]:
         plt.figure()
         ax = plt.gca()
         any_plotted = False
 
-        for label, (steps, evals) in run_label_to_series.items():
-            ys = [float(e.get(metric, float("nan"))) for e in evals]
-            if all(math.isnan(y) for y in ys):
+        # 1) Individual runs: semi-transparent, no legend entry
+        for base, runs in base_to_runs.items():
+            color = base_to_color[base]
+            for steps, evals in runs:
+                ys = [float(e.get(metric, float("nan"))) for e in evals]
+                if all(math.isnan(y) for y in ys):
+                    continue
+                ax.plot(
+                    steps,
+                    ys,
+                    marker="o",
+                    color=color,
+                    alpha=0.25,
+                    linewidth=1.0,
+                    markersize=4,
+                    label=None,
+                )
+                any_plotted = True
+
+        # 2) Mean per method: opaque, thicker, legend entry
+        for base, runs in base_to_runs.items():
+            mean_steps, mean_vals = _mean_series_for_metric(runs, metric)
+            if not mean_steps:
                 continue
-            ax.plot(steps, ys, marker="o", label=label)
+            ax.plot(
+                mean_steps,
+                mean_vals,
+                marker="o",
+                color=base_to_color[base],
+                alpha=1.0,
+                linewidth=2.5,
+                markersize=6,
+                label=f"{base} (mean)",
+            )
             any_plotted = True
 
         if not any_plotted:
             plt.close()
             continue
 
+        # ax.set_xlabel("Training step (checkpoint)")
+        # ax.set_ylabel(ylabel)
+        # ax.set_title(title)
         ax.set_xlabel("Training step (checkpoint)")
-        ax.set_ylabel(ylabel)
-        ax.set_title(title)
+        ax.set_ylabel(axis_label(metric))
+        ax.set_title(f"Training dynamics: {pretty_metric(metric)} vs step — {better_text(metric)}")
         ax.legend()
         _savefig(out_dir / fname)
+
+
+def _base_label(label: str) -> str:
+    # label is either "ec2_p_anneal" OR "ec2_p_anneal:ec2_p_anneal_20260102_205302"
+    return label.split(":", 1)[0]
+
+
+def _assign_colors_by_base(labels: Iterable[str]) -> Dict[str, str]:
+    """
+    Deterministically assign a matplotlib-cycle color to each base label.
+    All timestamped runs of the same method share the same color.
+    """
+    bases = sorted(set(_base_label(l) for l in labels))
+
+    # Use matplotlib's default prop_cycle (not hardcoded colors)
+    cycle = plt.rcParams.get("axes.prop_cycle", None)
+    colors = []
+    if cycle is not None:
+        try:
+            colors = cycle.by_key().get("color", [])
+        except Exception:
+            colors = []
+    if not colors:
+        # Fallback: use Matplotlib's "C0..C9" named cycle
+        colors = [f"C{i}" for i in range(10)]
+
+    return {b: colors[i % len(colors)] for i, b in enumerate(bases)}
 
 
 def plot_train_trajectory(
     run_label_to_series: Dict[str, Tuple[List[int], List[Dict[str, float]]]],
     out_dir: Path,
 ) -> None:
-    """
-    Plot redundancy vs recon over checkpoints, with lines in checkpoint order.
-      x = fvu
-      y = avg_max_decoder_cos
-    """
+    base_to_color = _assign_colors_by_base(run_label_to_series.keys())
+
+    # Group series by base method name
+    base_to_runs: Dict[str, List[Tuple[List[int], List[Dict[str, float]]]]] = {}
+    for label, (steps, evals) in run_label_to_series.items():
+        base_to_runs.setdefault(_base_label(label), []).append((steps, evals))
+
+    def _mean_xy_by_step(
+        runs: List[Tuple[List[int], List[Dict[str, float]]]]
+    ) -> Tuple[List[int], List[float], List[float]]:
+        # step -> list of xs (fvu), ys (cos)
+        step_to_xs: Dict[int, List[float]] = {}
+        step_to_ys: Dict[int, List[float]] = {}
+
+        for steps, evals in runs:
+            for s, e in zip(steps, evals):
+                x = e.get("fvu", float("nan"))
+                y = e.get("avg_max_decoder_cos", float("nan"))
+                if any(isinstance(v, float) and math.isnan(v) for v in [x, y]):
+                    continue
+                step = int(s)
+                step_to_xs.setdefault(step, []).append(float(x))
+                step_to_ys.setdefault(step, []).append(float(y))
+
+        mean_steps = sorted(set(step_to_xs.keys()) & set(step_to_ys.keys()))
+        mean_xs = [sum(step_to_xs[s]) / len(step_to_xs[s]) for s in mean_steps]
+        mean_ys = [sum(step_to_ys[s]) / len(step_to_ys[s]) for s in mean_steps]
+        return mean_steps, mean_xs, mean_ys
+
     plt.figure()
     ax = plt.gca()
     any_plotted = False
 
-    for label, (_steps, evals) in run_label_to_series.items():
-        xs = [float(e.get("fvu", float("nan"))) for e in evals]
-        ys = [float(e.get("avg_max_decoder_cos", float("nan"))) for e in evals]
-        if all(math.isnan(x) for x in xs) or all(math.isnan(y) for y in ys):
+    # 1) Individual runs: semi-transparent, no legend entry
+    for base, runs in base_to_runs.items():
+        color = base_to_color[base]
+        for _steps, evals in runs:
+            xs = [float(e.get("fvu", float("nan"))) for e in evals]
+            ys = [float(e.get("avg_max_decoder_cos", float("nan"))) for e in evals]
+            if all(math.isnan(x) for x in xs) or all(math.isnan(y) for y in ys):
+                continue
+            ax.plot(
+                xs,
+                ys,
+                marker="o",
+                color=color,
+                alpha=0.25,
+                linewidth=1.0,
+                markersize=4,
+                label=None,
+            )
+            any_plotted = True
+
+    # 2) Mean trajectory per method: opaque, thicker, legend entry
+    for base, runs in base_to_runs.items():
+        _mean_steps, mean_xs, mean_ys = _mean_xy_by_step(runs)
+        if not mean_xs or not mean_ys:
             continue
-        ax.plot(xs, ys, marker="o", label=label)
+        ax.plot(
+            mean_xs,
+            mean_ys,
+            marker="o",
+            color=base_to_color[base],
+            alpha=1.0,
+            linewidth=2.5,
+            markersize=6,
+            label=f"{base} (mean)",
+        )
         any_plotted = True
 
     if not any_plotted:
         plt.close()
         return
 
-    ax.set_xlabel("FVU (lower better)")
-    ax.set_ylabel("AvgMax decoder cosine (lower better)")
-    ax.set_title("Train (checkpoints): Redundancy vs Reconstruction trajectory")
+    # ax.set_xlabel("FVU (lower better)")
+    # ax.set_ylabel("AvgMax decoder cosine (lower better)")
+    ax.set_title("Variance Unexplained vs Decoder Redundancy\n(bottom left = good)")
+    ax.set_xlabel(axis_label("fvu"))
+    ax.set_ylabel(axis_label("avg_max_decoder_cos"))
+    # ax.set_title("Training trajectory: redundancy vs reconstruction — lower is better")
     ax.legend()
     _savefig(out_dir / "train_trajectory_redundancy_vs_fvu.png")
 
+def _ckpt_eval_cache_path(run_dir: Path) -> Path:
+    return run_dir / "checkpoint_eval_cache.json"
+
+
+def _load_ckpt_eval_cache(run_dir: Path) -> Dict[str, Any]:
+    p = _ckpt_eval_cache_path(run_dir)
+    if not p.exists():
+        return {}
+    try:
+        return json.loads(p.read_text())
+    except Exception:
+        return {}
+
+
+def _save_ckpt_eval_cache(run_dir: Path, cache: Dict[str, Any]) -> None:
+    p = _ckpt_eval_cache_path(run_dir)
+    p.write_text(json.dumps(cache, indent=2, sort_keys=True))
 
 # ---------------------------
 # Schedules from metrics.jsonl
 # ---------------------------
-
 def plot_schedules_from_metrics(
     run_label_to_metrics_rows: Dict[str, List[Dict[str, Any]]],
     out_dir: Path,
 ) -> None:
-    # p_current vs step
+    base_to_color = _assign_colors_by_base(run_label_to_metrics_rows.keys())
+
+    # Group rows by base label (prefix before ':')
+    base_to_runs: Dict[str, List[List[Dict[str, Any]]]] = {}
+    for label, rows in run_label_to_metrics_rows.items():
+        base_to_runs.setdefault(_base_label(label), []).append(rows)
+
+    def _plot_series(
+        ax,
+        rows: List[Dict[str, Any]],
+        key: str,
+        *,
+        color: str,
+        alpha: float,
+        label: Optional[str],
+        linewidth: float,
+    ) -> bool:
+        xs, ys = [], []
+        for r in rows:
+            if "step" in r and key in r:
+                xs.append(int(r["step"]))
+                ys.append(float(r[key]))
+        if not xs:
+            return False
+        ax.plot(xs, ys, color=color, alpha=alpha, linewidth=linewidth, label=label)
+        return True
+
+    def _mean_rows_for_key(
+        runs: List[List[Dict[str, Any]]],
+        key: str,
+    ) -> Tuple[List[int], List[float]]:
+        # step -> list of values across runs
+        step_to_vals: Dict[int, List[float]] = {}
+        for rows in runs:
+            for r in rows:
+                if "step" in r and key in r:
+                    step_to_vals.setdefault(int(r["step"]), []).append(float(r[key]))
+        steps = sorted(step_to_vals.keys())
+        means = [sum(step_to_vals[s]) / len(step_to_vals[s]) for s in steps]
+        return steps, means
+
+    # ---- p_current ----
     plt.figure()
     ax = plt.gca()
     any_plotted = False
-    for label, rows in run_label_to_metrics_rows.items():
-        xs, ys = [], []
-        for r in rows:
-            if "step" in r and ("p_current" in r):
-                xs.append(int(r["step"]))
-                ys.append(float(r["p_current"]))
-        if xs:
-            ax.plot(xs, ys, label=label)
+
+    # individual runs (transparent, no legend)
+    for base, runs in base_to_runs.items():
+        color = base_to_color[base]
+        for rows in runs:
+            any_plotted |= _plot_series(
+                ax, rows, "p_current", color=color, alpha=0.25, label=None, linewidth=1.0
+            )
+
+    # mean per base (opaque, legend shows base only)
+    for base, runs in base_to_runs.items():
+        steps, means = _mean_rows_for_key(runs, "p_current")
+        if steps:
+            ax.plot(
+                steps,
+                means,
+                color=base_to_color[base],
+                alpha=1.0,
+                linewidth=2.5,
+                label=base,  # <-- prefix only
+            )
             any_plotted = True
+
     if any_plotted:
-        ax.set_xlabel("Step")
-        ax.set_ylabel("p_current")
-        ax.set_title("Schedules: p_current vs step")
-        ax.legend()
+        ax.set_xlabel("Training step")
+        ax.set_ylabel(axis_label("p_current"))
+        ax.set_title(
+            "Sparsity curvature schedule\n"
+            f"{pretty_metric('p_current')} over training ({better_text('p_current')})"
+        )
+        ax.legend(loc="best", fontsize=8)
         _savefig(out_dir / "schedule_p_current_vs_step.png")
     else:
         plt.close()
 
-    # lambda stats vs step (mean/min/max when present)
-    for key, ylabel, fname in [
-        ("lambda_mean", "lambda_mean", "schedule_lambda_mean_vs_step.png"),
-        ("lambda_min", "lambda_min", "schedule_lambda_min_vs_step.png"),
-        ("lambda_max", "lambda_max", "schedule_lambda_max_vs_step.png"),
-    ]:
+    # ---- lambda stats ----
+    for key in ["lambda_mean", "lambda_min", "lambda_max"]:
         plt.figure()
         ax = plt.gca()
         any_plotted = False
-        for label, rows in run_label_to_metrics_rows.items():
-            xs, ys = [], []
-            for r in rows:
-                if "step" in r and key in r:
-                    xs.append(int(r["step"]))
-                    ys.append(float(r[key]))
-            if xs:
-                ax.plot(xs, ys, label=label)
+
+        # individual runs (transparent)
+        for base, runs in base_to_runs.items():
+            color = base_to_color[base]
+            for rows in runs:
+                any_plotted |= _plot_series(
+                    ax, rows, key, color=color, alpha=0.25, label=None, linewidth=1.0
+                )
+
+        # mean per base (opaque, legend shows base only)
+        for base, runs in base_to_runs.items():
+            steps, means = _mean_rows_for_key(runs, key)
+            if steps:
+                ax.plot(
+                    steps,
+                    means,
+                    color=base_to_color[base],
+                    alpha=1.0,
+                    linewidth=2.5,
+                    label=base,  # <-- prefix only
+                )
                 any_plotted = True
+
         if any_plotted:
-            ax.set_xlabel("Step")
-            ax.set_ylabel(ylabel)
-            ax.set_title(f"Schedules: {key} vs step")
-            ax.legend()
-            _savefig(out_dir / fname)
+            ax.set_xlabel("Training step")
+            ax.set_ylabel(axis_label(key))
+            ax.set_title(
+                "Frequency weighting schedule\n"
+                f"{pretty_metric(key)} over training ({better_text(key)})"
+            )
+            ax.legend(loc="best", fontsize=8)
+            _savefig(out_dir / f"schedule_{key}_vs_step.png")
         else:
             plt.close()
-
 
 # ---------------------------
 # Torch load wrapper (keeps imports tidy)
@@ -614,7 +964,7 @@ def main() -> None:
         "--train_run_names",
         type=str,
         nargs="*",
-        default=["mac_l1_uniform", "mac_p_anneal", "mac_freq_l1", "mac_combined"],
+        default=["ec2_freq_l1", "ec2_l1_uniform", "ec2_p_anneal", "ec2_combined", "ec2_batchtopk"],
         help="Train run_name prefixes to include (folders are runs/<run_name>_<timestamp>/...)",
     )
     ap.add_argument(
@@ -622,6 +972,7 @@ def main() -> None:
         action="store_true",
         help="If set, evaluate checkpoints for ALL timestamped dirs per run_name (slower). "
              "Otherwise uses most recent run dir per run_name for time-series plots.",
+        default=True
     )
 
     ap.add_argument(
@@ -644,6 +995,13 @@ def main() -> None:
         default=5,
         help="Override cfg.eval_num_batches for checkpoint eval (smaller=faster, noisier).",
     )
+    ap.add_argument(
+        "--recompute_cached",
+        action="store_true",
+        default=False,
+        help="If set, ignore any cached checkpoint eval results and recompute them.",
+    )
+
 
     args = ap.parse_args()
     runs_dir = Path(args.runs_dir)
@@ -714,6 +1072,7 @@ def main() -> None:
                     device_override=args.device,
                     dtype_override=args.dtype,
                     eval_num_batches_override=args.eval_num_batches,
+                    recompute_cached=args.recompute_cached,
                 )
                 run_label_to_series[label] = (steps, evals)
             except Exception as e:

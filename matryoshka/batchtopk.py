@@ -1,11 +1,13 @@
 # batchtopk.py
 from __future__ import annotations
+
 import math
 from typing import Dict, Literal, Tuple, Optional
+
 import torch
 
-
 TieBreak = Literal["none", "random"]
+
 
 def apply_batchtopk(
     a: torch.Tensor,          # [..., K]
@@ -74,49 +76,58 @@ def apply_batchtopk(
             "bt_density": 1.0,
         }
 
+    # Flatten once; do all selection logic on a detached view under no_grad
     flat = a.reshape(-1)
+    flat_det = flat.detach()
 
-    # Threshold tau = keep_target-th largest value.
-    # Prefer kthvalue on -flat (avoids materializing top-k values).
-    try:
-        tau = -torch.kthvalue(-flat, k=keep_target).values  # scalar tensor
-    except RuntimeError:
-        # Fallback if kthvalue isn't supported/fast on a given backend
-        topv, _ = torch.topk(flat, k=keep_target, largest=True, sorted=False)
-        tau = topv.min()
+    with torch.no_grad():
+        # Threshold tau = keep_target-th largest value.
+        # Prefer kthvalue on -flat (avoids materializing top-k values).
+        try:
+            tau = -torch.kthvalue(-flat_det, k=keep_target).values  # scalar tensor
+        except RuntimeError:
+            # Fallback if kthvalue isn't supported/fast on a given backend
+            topv, _ = torch.topk(flat_det, k=keep_target, largest=True, sorted=False)
+            tau = topv.min()
 
-    if tie_break == "none":
-        # Keep everything >= tau (allowing slight eps slack)
-        mask_flat = flat >= (tau - eps)
+        if tie_break == "none":
+            # Keep everything >= tau (allowing slight eps slack)
+            keep_idx = torch.nonzero(flat_det >= (tau - eps), as_tuple=False).squeeze(1)
 
-    elif tie_break == "random":
-        # Keep everything strictly greater than tau, then randomly choose among ties near tau.
-        mask_flat = flat > (tau + eps)
-        keep_gt = int(mask_flat.sum().item())
-        need = keep_target - keep_gt
+        elif tie_break == "random":
+            # Keep everything strictly > tau, then randomly choose among ties near tau to hit target exactly.
+            gt_idx = torch.nonzero(flat_det > (tau + eps), as_tuple=False).squeeze(1)
+            keep_gt = int(gt_idx.numel())
+            need = keep_target - keep_gt
 
-        if need > 0:
-            close = (flat >= (tau - eps)) & (flat <= (tau + eps)) & (~mask_flat)
-            close_idx = torch.nonzero(close, as_tuple=False).squeeze(1)
-
-            if close_idx.numel() >= need:
-                perm = torch.randperm(close_idx.numel(), device=a.device, generator=generator)
-                chosen = close_idx[perm[:need]]
-                mask_flat[chosen] = True
+            if need <= 0:
+                # Rare: if numerical eps makes gt already enough, just take top-k exactly.
+                _, keep_idx = torch.topk(flat_det, k=keep_target, largest=True, sorted=False)
             else:
-                # Fallback: include all "close" and if still short, do exact topk mask.
-                mask_flat[close_idx] = True
-                if int(mask_flat.sum().item()) < keep_target:
-                    _, top_idx = torch.topk(flat, k=keep_target, largest=True, sorted=False)
-                    mask_flat = torch.zeros_like(mask_flat, dtype=torch.bool)
-                    mask_flat[top_idx] = True
-    else:
-        raise ValueError(f"Unknown tie_break={tie_break!r}")
+                close_mask = (flat_det >= (tau - eps)) & (flat_det <= (tau + eps))
+                close_idx = torch.nonzero(close_mask, as_tuple=False).squeeze(1)
 
-    keep_actual = int(mask_flat.sum().item())
-    mask = mask_flat.reshape(a.shape)
-    a_sparse = a * mask.to(dtype=a.dtype)
+                # Exclude any already in gt_idx by filtering with a strict band; (gt_idx are > tau+eps)
+                # So close_idx are disjoint from gt_idx by construction.
 
+                if int(close_idx.numel()) >= need:
+                    perm = torch.randperm(close_idx.numel(), device=a.device, generator=generator)
+                    chosen = close_idx[perm[:need]]
+                    keep_idx = torch.cat([gt_idx, chosen], dim=0)
+                else:
+                    # If too few "close" values (or weird numeric issues), fall back to exact topk indices.
+                    _, keep_idx = torch.topk(flat_det, k=keep_target, largest=True, sorted=False)
+
+        else:
+            raise ValueError(f"Unknown tie_break={tie_break!r}")
+
+    # Build output without allocating a full boolean mask:
+    # write kept entries into a zero tensor.
+    a_sparse = torch.zeros_like(a)
+    a_sparse_flat = a_sparse.reshape(-1)
+    a_sparse_flat[keep_idx] = flat[keep_idx]
+
+    keep_actual = int(keep_idx.numel())
     stats = {
         "bt_tau": float(tau.detach().item()),
         "bt_keep_target": float(keep_target),

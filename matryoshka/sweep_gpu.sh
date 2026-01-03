@@ -30,15 +30,15 @@ TRAIN_FLAGS="--num_steps ${NUM_STEPS} --batch_size ${BATCH_SIZE} --eval_num_batc
 # IMPORTANT: keep run_name stable across seeds so plots aggregate.
 # run_name is the first field here.
 JOBS=(
-  "ec2_l1_uniform|l1_uniform|2|--lambda_base ${LAM_L1_UNIFORM}"
-  "ec2_p_anneal|p_annealing|2|--lambda_base ${LAM_P_ANNEAL} --p_start ${P_START} --p_end ${P_END}"
-  "ec2_freq_l1|l1_freq_weighted|2|--lambda_base ${LAM_FREQ} --fw_alpha 0.5 --fw_warmup_steps 25"
-  "ec2_combined|p_annealing_freq|2|--lambda_base ${LAM_COMBINED} --p_start ${P_START} --p_end ${P_END} --fw_alpha 0.5 --fw_warmup_steps 25"
-  "ec2_batchtopk|batchtopk|2|--target_l0 ${TARGET_L0}"
+  "ec2_l1_uniform|l1_uniform|7|--lambda_base ${LAM_L1_UNIFORM}"
+  "ec2_p_anneal|p_annealing|7|--lambda_base ${LAM_P_ANNEAL} --p_start ${P_START} --p_end ${P_END}"
+  "ec2_freq_l1|l1_freq_weighted|7|--lambda_base ${LAM_FREQ} --fw_alpha 0.5 --fw_warmup_steps 25"
+  "ec2_combined|p_annealing_freq|7|--lambda_base ${LAM_COMBINED} --p_start ${P_START} --p_end ${P_END} --fw_alpha 0.5 --fw_warmup_steps 25"
+  "ec2_batchtopk|batchtopk|7|--target_l0 ${TARGET_L0} --batch_size 4"
 
-  "ec2_batchtopk|batchtopk|0|--target_l0 ${TARGET_L0} --batch_size 4"
-  "ec2_batchtopk|batchtopk|1|--target_l0 ${TARGET_L0} --batch_size 4"
-  "ec2_batchtopk|batchtopk|2|--target_l0 ${TARGET_L0} --batch_size 4"
+#   "ec2_batchtopk|batchtopk|0|--target_l0 ${TARGET_L0} --batch_size 4"
+#   "ec2_batchtopk|batchtopk|1|--target_l0 ${TARGET_L0} --batch_size 4"
+#   "ec2_batchtopk|batchtopk|2|--target_l0 ${TARGET_L0} --batch_size 4"
 
 #   # extra capacity (use for repeats)
 #   "ec2_l1_uniform|l1_uniform|2|--lambda_base ${LAM_L1_UNIFORM}"
